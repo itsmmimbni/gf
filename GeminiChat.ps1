@@ -28,6 +28,7 @@ function Start-GeminiChat {
     
     # --- 3. STATE AWAL ---
     $script:chatHistory = @()
+    $script:promptVars = @{} # Hashtable untuk menyimpan {{1}}, {{2}}, dst.
     $isBrief = $false
     $lastResponse = ""
     
@@ -71,15 +72,56 @@ function Start-GeminiChat {
             Write-Host " /logs [idx]  : Lihat daftar/preview history" -ForegroundColor Gray
             Write-Host " /del [idx]   : Hapus file history" -ForegroundColor Gray
             Write-Host " /ren [idx]   : Rename file history" -ForegroundColor Gray
-            Write-Host " /brief       : Toggle mode jawaban singkat" -ForegroundColor Gray
+            Write-Host " /brief       : Toggle mode jawaban singkat (1 paragraf)" -ForegroundColor Gray
             Write-Host " /clear       : Bersihkan layar (tetap ingat percakapan)" -ForegroundColor Gray
-            Write-Host " /clear-chat  : Reset chat & layar (lupa konteks)" -ForegroundColor Gray
-            Write-Host " /clean-logs  : Hapus paksa file log kosong saat ini" -ForegroundColor Gray
+            Write-Host " /clear-chat  : Reset total konteks chat (lupa ingatan)" -ForegroundColor Gray
+            Write-Host " /clean-logs  : Hapus paksa file log kosong (< 50 bytes)" -ForegroundColor Gray
             Write-Host " /copy        : Menyalin respons terakhir ke clipboard" -ForegroundColor Gray
-            Write-Host " /code [idx]  : Membuka file log di VSCode" -ForegroundColor Gray
+            Write-Host " /paste [n]   : Simpan clipboard ke variabel {{n}} atau langsung kirim" -ForegroundColor Gray
+            Write-Host " /vars        : Tampilkan daftar variabel {{n}} yang tersimpan" -ForegroundColor Gray
+            Write-Host " /code [idx]  : Membuka file log di VS Code" -ForegroundColor Gray
+            
+            Write-Host "`n[ TIPS PROMPT ENGINEERING ]" -ForegroundColor Yellow
+            Write-Host " Gunakan {{1}}, {{2}}, dst. di dalam prompt untuk memanggil teks" -ForegroundColor Gray
+            Write-Host " yang sudah di-paste sebelumnya." -ForegroundColor Gray
+            
             $commandProcessed = $true; continue
         }
         
+        # --- LOGIC PASTE KE VARIABLE (/paste [idx]) ---
+        if ($userInput -match "^/paste(\s+(\d+))?$") {
+            $idx = $Matches[2]
+            $cbText = Get-Clipboard -Raw
+            
+            if ([string]::IsNullOrWhiteSpace($cbText)) {
+                Write-Host "[!] Clipboard kosong." -ForegroundColor Yellow
+                continue
+            }
+
+            if ($null -eq $idx) {
+                # Jika cuma /paste tanpa angka, jalankan seperti biasa (langsung kirim)
+                $userInput = $cbText.Trim()
+                Write-Host "[Mendeteksi $($userInput.Length) karakter dari clipboard]" -ForegroundColor DarkGray
+                $commandProcessed = $false
+            } else {
+                # Jika /paste 1, simpan ke variabel {{1}}
+                $script:promptVars[$idx] = $cbText.Trim()
+                Write-Host "[√] Berhasil disimpan ke {{ $idx }} ($($cbText.Length) karakter)" -ForegroundColor Green
+                $commandProcessed = $true
+                continue
+            }
+        }
+
+        if ($userInput -eq "/vars") {
+            Write-Host "`n--- Daftar Variabel Prompt ---" -ForegroundColor Cyan
+            foreach ($key in $script:promptVars.Keys) {
+                $preview = $script:promptVars[$key].SubString(0, [Math]::Min(50, $script:promptVars[$key].Length))
+                Write-Host "{{$key}} : $preview..." -ForegroundColor Gray
+            }
+            $commandProcessed = $true
+            continue
+        }
+
         if ($userInput -eq "/clear") { 
             Show-Header -isBrief $isBrief -msgCount ($script:chatHistory.Count / 2) -currentLog $script:logFile
             $commandProcessed = $true; continue 
@@ -154,11 +196,19 @@ function Start-GeminiChat {
             continue
         }
 
-        # --- 5. REQUEST KE API ---
+        # --- 5. REQUEST KE API (FIXED LOGIC) ---
+        $finalPrompt = if ($isBrief) { "Answer briefly in 1 paragraph: $userInput" } else { $userInput }
+
+        foreach ($key in $script:promptVars.Keys) {
+            $placeholder = "{{" + $key + "}}"
+            if ($finalPrompt.Contains($placeholder)) {
+                $finalPrompt = $finalPrompt.Replace($placeholder, $script:promptVars[$key])
+            }
+        }
+
         $maxTokens = if ($isBrief) { 200 } else { 2048 }
-        $prompt = if ($isBrief) { "Answer briefly in 1 paragraph: $userInput" } else { $userInput }
+        $script:chatHistory += @{ role = "user"; parts = @(@{ text = $finalPrompt }) }
         
-        $script:chatHistory += @{ role = "user"; parts = @(@{ text = $prompt }) }
         Write-Host "Gemini thinking..." -ForegroundColor DarkGray
 
         try {
@@ -171,7 +221,8 @@ function Start-GeminiChat {
                 Write-Host "`n--- Gemini ---" -ForegroundColor Green
                 Write-Markdown -entireText $aiResponse
                 
-                $script:chatHistory += @{ role = "model"; parts = @(@{ text = $aiResponse }) }
+                # 3. Masukkan ke history menggunakan $finalPrompt
+                $script:chatHistory += @{ role = "user"; parts = @(@{ text = $finalPrompt }) }
 
                 # Log to file
                 $logEntry = "## [TIME] $(Get-Date -Format 'HH:mm:ss')`n- **Anda:** $userInput`n- **Gemini:**`n$aiResponse`n---`n"
